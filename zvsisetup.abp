@@ -1,0 +1,326 @@
+*----------------------------------------------------------------------*
+* Setup for the ABAP Virus Scan Interface                              *
+*----------------------------------------------------------------------*
+REPORT  zvsisetup.
+
+TYPE-POOLS:
+  abap.
+
+PARAMETERS: vsa_lib TYPE vscan_server_vsa_lib,
+            group   TYPE string DEFAULT 'DEFAULT',
+            profile TYPE string DEFAULT 'ZDEFAULT'.
+
+
+DATA:
+  gf_cursor_field(20) TYPE c,
+  gf_okcode(20)       TYPE c,
+  gf_rc               TYPE i,
+  gf_msg_buf          TYPE string,
+  gf_exception        TYPE abap_bool,
+  gf_data             TYPE xstring,
+  lf_blob             TYPE xstring,
+  gf_data_clean       TYPE xstring,
+  ls_vscan_group      TYPE vscan_group,
+  ls_vscan_server     TYPE vscan_server,
+  ls_vscan_prof       TYPE vscan_prof,
+  ls_vscan_step       TYPE vscan_prof_grp,
+  ls_vscan_param      TYPE vscan_prof_par,
+  lt_vscan_profs      TYPE TABLE OF vscan_prof,
+  bvscangroup(1)      TYPE c VALUE ' ',
+  bvscanserver(1)     TYPE c VALUE ' ',
+  bzvscanprof(1)      TYPE c VALUE ' ',
+  lo_vsa              TYPE REF TO cl_vscan_adapter.
+
+
+* Get the data from the instance
+DATA:
+  lf_regex       TYPE string,
+  ls_vsa_info    TYPE vscan_rfc_vsa_info,
+  ls_server_info TYPE vscan_rfc_server_info,
+  lt_parameter   TYPE vscan_rfc_param_t,
+  ls_engine_info TYPE vscan_rfc_engine_info,
+  lt_driver_info TYPE vscan_rfc_driver_info_t,
+  lf_from_buffer TYPE abap_bool.
+
+DATA:
+  gf_started          TYPE abap_bool VALUE ' ',
+  gf_scanrc           TYPE vscan_scanrc,
+  gt_bapiret          TYPE vscan_bapiret2_t,
+  gt_scanerror        TYPE vscan_scanerror_t,
+  gt_infection        TYPE vscan_infection_t.
+
+
+****************************************
+*
+*  create configuration
+*
+*****************************************
+
+INITIALIZATION.
+  DATA: c_name TYPE c LENGTH 10.
+  DATA: c_value TYPE c LENGTH 2048.
+
+  c_name = 'VSA_LIB'.
+  CALL 'C_GETENV' ID 'NAME'  FIELD c_name  "#EC CI_CCALL
+                  ID 'VALUE' FIELD c_value.
+
+  IF c_value IS INITIAL.
+    IF sy-opsys = 'Linux'.
+      vsa_lib = 'libsapcsa.so'.
+    ELSEIF sy-opsys CS 'Windows'.
+      vsa_lib = 'sapcsa.dll'.
+    ELSE.
+      vsa_lib = 'libsapcsa.so'.
+    ENDIF.
+  ELSE.
+    vsa_lib = c_value.
+  ENDIF.
+
+  CONCATENATE 'VSA_' sy-host INTO ls_vscan_server-name.
+  TRANSLATE ls_vscan_server-name TO UPPER CASE.
+
+  SELECT SINGLE * FROM vscan_server INTO ls_vscan_server
+         WHERE name = ls_vscan_server-name.
+
+  IF sy-subrc = 0.
+    DATA vname TYPE string.
+    vname = ls_vscan_server-name.
+    PERFORM start_customizing USING vname.
+    RETURN.
+  ENDIF.
+
+START-OF-SELECTION.
+  SELECT SINGLE * FROM vscan_server INTO ls_vscan_server
+         WHERE name = ls_vscan_server-name.
+
+
+  IF sy-subrc = 0.
+    DATA vvname TYPE string.
+    vname = ls_vscan_server-name.
+    PERFORM start_customizing USING vname.
+    EXIT.
+  ENDIF.
+  ls_vscan_server-type = 'ADAPTER'.
+  ls_vscan_server-scangroup = 'DEFAULT'.
+  ls_vscan_server-status = 'ACTV'.
+  ls_vscan_server-initinterval = '0024'.
+  CALL 'C_SAPGPARAM'                                      "#EC CI_CCALL
+                 ID 'NAME'  FIELD 'rdisp/myname'
+                 ID 'VALUE' FIELD ls_vscan_server-asname.
+  ls_vscan_server-vsa_lib = vsa_lib.
+  ls_vscan_group-scangroup = group.
+  INSERT INTO vscan_group VALUES ls_vscan_group.
+  IF sy-subrc = 0.
+    bvscangroup = 'X'.
+  ELSE.
+    bvscangroup = ' '.
+  ENDIF.
+
+  INSERT INTO vscan_server VALUES ls_vscan_server.
+  IF sy-subrc = 0.
+    bvscanserver = 'X'.
+  ELSE.
+    bvscanserver = ' '.
+  ENDIF.
+
+****************************************
+*
+*  start test
+*
+*****************************************
+  CALL METHOD cl_vscan_adapter=>start_local_adapter
+    EXPORTING
+      name        = ls_vscan_server-name
+      vsa_lib     = ls_vscan_server-vsa_lib
+    IMPORTING
+      eo_adapter  = lo_vsa
+      error_msg   = gf_msg_buf
+      return_code = gf_rc
+    EXCEPTIONS
+      OTHERS      = 1.
+  IF sy-subrc <> 0 OR gf_rc <> 0.
+    IF gf_msg_buf IS INITIAL.
+      WRITE: 'No instance available' .
+    ELSE.
+      WRITE: gf_msg_buf.
+    ENDIF.
+    IF bvscanserver = 'X'.
+      DELETE vscan_server FROM ls_vscan_server.
+    ENDIF.
+    IF bvscangroup = 'X'.
+      DELETE vscan_group FROM ls_vscan_group.
+    ENDIF.
+    EXIT.
+  ENDIF.
+
+  IF lo_vsa->is_alive( ) = abap_false.
+    gf_started = abap_true.
+    CALL METHOD lo_vsa->start_on_appserver
+      EXPORTING
+        if_reinit = abap_false
+      EXCEPTIONS
+        OTHERS    = 1.
+    IF sy-subrc <> 0.
+      IF bvscanserver = 'X'.
+        DELETE vscan_server FROM ls_vscan_server.
+      ENDIF.
+      IF bvscangroup = 'X'.
+        DELETE vscan_group FROM ls_vscan_group.
+      ENDIF.
+      CONCATENATE 'This server: ' sy-host ' cannot start the VSA. '
+          'Check trace in SM50' INTO gf_msg_buf RESPECTING BLANKS.
+      WRITE: gf_msg_buf .
+      EXIT.
+    ENDIF.
+  ELSE.
+    " create profile
+    SELECT * FROM vscan_prof INTO TABLE lt_vscan_profs.
+
+    DATA: bneedz TYPE c VALUE 'X',
+          bact  TYPE c  VALUE ' '.
+    LOOP AT lt_vscan_profs INTO ls_vscan_prof.
+      IF ls_vscan_prof-active = 'X'.
+        bact = 'X'.
+      ENDIF.
+      IF ls_vscan_prof-profile = profile.
+        bneedz = ' '.
+      ENDIF.
+    ENDLOOP.
+
+    ls_vscan_prof-active = 'X'.
+    ls_vscan_prof-is_default = 'X'.
+    ls_vscan_prof-mandt = sy-mandt.
+    ls_vscan_prof-profile = profile.
+    ls_vscan_prof-profile_cond = 'AND'.
+    ls_vscan_prof-reference = ' '.
+    ls_vscan_prof-use_ref = ' '.
+    INSERT INTO vscan_prof VALUES ls_vscan_prof.
+    IF sy-subrc = 0.
+      bzvscanprof  = 'X'.
+    ELSE.
+      bzvscanprof  = ' '.
+    ENDIF.
+
+    IF bzvscanprof  = 'X'.
+      LOOP AT lt_vscan_profs INTO ls_vscan_prof.
+        ls_vscan_prof-active = 'X'.
+        UPDATE vscan_prof FROM ls_vscan_prof.
+      ENDLOOP.
+    ENDIF.
+    ls_vscan_step-group_order = 0.
+    ls_vscan_step-mandt = sy-mandt.
+    ls_vscan_step-profile = profile.
+    ls_vscan_step-scangroup = group.
+    ls_vscan_step-step_type = 'GROUP'.
+    INSERT INTO vscan_prof_grp VALUES ls_vscan_step.
+
+    ls_vscan_param-group_order = 0.
+    ls_vscan_param-mandt = sy-mandt.
+    ls_vscan_param-parameter_key = 'CUST_NOT_SCANNED_AS_WARNING'.
+    ls_vscan_param-parameter_value = '1'.
+    ls_vscan_param-profile = profile.
+    INSERT INTO vscan_prof_par VALUES ls_vscan_param.
+
+
+  ENDIF.
+  CALL METHOD lo_vsa->get_engine_info
+    IMPORTING
+      es_engine_info = ls_engine_info
+      et_driver_info = lt_driver_info.
+
+  IF sy-subrc <> 0.
+    WRITE: 'Vsa engine failed'.
+    EXIT.
+  ENDIF.
+
+  CALL METHOD lo_vsa->get_vsa_info
+    IMPORTING
+      es_vsa_info    = ls_vsa_info
+      et_parameters  = lt_parameter
+      ef_from_buffer = lf_from_buffer
+    EXCEPTIONS
+      not_available  = 1
+      OTHERS         = 2.
+
+  IF sy-subrc <> 0.
+    WRITE:  'Vsa info failed'.
+    EXIT.
+  ENDIF.
+
+
+  DEFINE def_add_blob.
+    lf_blob = &1.
+    concatenate
+        gf_data
+        lf_blob
+      into
+        gf_data
+      in byte mode.
+  END-OF-DEFINITION.
+
+  CLEAR gf_data.
+  def_add_blob '58354F2150254041505B345C505A58353428505E'.
+  def_add_blob '2937434329377D2445494341522D5354414E4441'.
+  def_add_blob '52442D414E544956495255532D544553542D4649'.
+  def_add_blob '4C452124482B482A'.
+
+
+
+  CALL METHOD lo_vsa->if_vscan_instance~scan_bytes
+    EXPORTING
+      if_job_id           = 'EICAR.EXE'
+      if_data             = gf_data
+      if_do_clean         = abap_false
+      if_active_content   = abap_false
+      if_no_details       = abap_false
+    IMPORTING
+      ef_scanrc           = gf_scanrc
+      ef_data             = gf_data_clean
+      et_bapiret          = gt_bapiret
+      et_scanerror        = gt_scanerror
+      et_infection        = gt_infection
+    EXCEPTIONS
+      not_available       = 1
+      configuration_error = 2
+      internal_error      = 3
+      OTHERS              = 4.
+  IF sy-subrc <> 0.
+    WRITE: 'Scan failed'.
+  ENDIF.
+  IF gf_scanrc <> -2.
+    WRITE: 'EICAR test virus not found'.
+  ENDIF.
+*-----------------------------------------------------------------------
+
+***********************************************************************
+* START_CUSTOMIZING
+* Call program RSVSCANCUST for this server
+***********************************************************************
+FORM start_customizing USING vname TYPE string.
+
+*   Single maintenance
+  DATA:
+    ls_sellist TYPE vimsellist,
+    lt_sellist TYPE STANDARD TABLE OF vimsellist.
+
+  ls_sellist-viewfield = 'NAME'.
+  ls_sellist-operator  = 'EQ'.
+  ls_sellist-value     = vname.
+  APPEND ls_sellist TO lt_sellist.
+
+  CALL FUNCTION 'VIEW_MAINTENANCE_CALL'
+    EXPORTING
+      action      = 'S'
+      view_name   = 'VSCAN_SERVER'
+    TABLES
+      dba_sellist = lt_sellist
+    EXCEPTIONS
+      OTHERS      = 1.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+            DISPLAY LIKE 'E'
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    "START_CUSTOMIZING
